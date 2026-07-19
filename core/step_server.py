@@ -20,10 +20,6 @@ _sys_b3.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
     import keystore as _keystore
     import signing as _signing
-    _keys_file    = os.getenv("F42BBS_KEYS")
-    _genesis_file = os.getenv("F42BBS_GENESIS")
-    if _keys_file:    _keystore.KEYS_FILE    = _keys_file
-    if _genesis_file: _keystore.GENESIS_FILE = _genesis_file
     _ED25519_PRIV, _ED25519_PUB = _keystore.get_ed25519(F42BBS_NODE_ID)
     _NODELIST = _keystore.get_nodelist(F42BBS_NODE_ID)
     _GENESIS  = _keystore.load_genesis()
@@ -369,41 +365,54 @@ def _http_fanout(env):
 _daemon._fanout = _http_fanout
 init_http_transport(_daemon, F42BBS_KEY)
 
+
 @app.route('/admit', methods=['POST'])
 def admit():
-    """Admission endpoint — sovereign right to accept or reject new nodes"""
+    """Node admission endpoint.
+    Request: {addr, ed25519_pub, x25519_pub, peer_url, label?}
+    Response: {status: "pending"|"admitted"|"rejected", reason?}
+    """
     try:
         data = request.get_json()
         if not data:
-            return jsonify({"rejected": "bad request"}), 400
+            return jsonify({"status": "rejected", "reason": "bad request"}), 400
 
-        node_id = data.get("id", "").strip()
-        transports = data.get("transports", [])
-        topics = data.get("topics", [])
+        addr       = data.get("addr", "").strip()
+        ed_pub     = data.get("ed25519_pub", "").strip()
+        x_pub      = data.get("x25519_pub", "").strip()
+        peer_url   = data.get("peer_url", "").strip()
+        label      = data.get("label", addr)
 
-        if not node_id:
-            return jsonify({"rejected": "missing id"}), 400
+        if not addr or not ed_pub or not x_pub or not peer_url:
+            return jsonify({"status": "rejected",
+                            "reason": "addr, ed25519_pub, x25519_pub, peer_url required"}), 400
 
-        # Assign child address: parent.N
-        parent = F42BBS_NODE_ID
-        existing = db.get_peers()
-        children = [p for p in existing if p.get('node_id', '').startswith(parent + '.')]
-        n = len(children) + 1
-        child_addr = f"{parent}.{n}"
+        # Check if already in nodelist
+        existing = next((e for e in _NODELIST if e.get("addr") == addr), None)
+        if existing:
+            return jsonify({"status": "admitted", "reason": "already in nodelist",
+                            "nodelist": _NODELIST}), 200
 
-        # Register as peer
-        transport = transports[0] if transports else ""
-        db.add_peer(child_addr, node_id, transport, "unverified")
+        # Save to pending
+        pending = _load_pending()
+        pending[addr] = {
+            "addr": addr, "ed25519_pub": ed_pub, "x25519_pub": x_pub,
+            "peer_url": peer_url, "label": label,
+            "ts": __import__("datetime").datetime.utcnow().isoformat() + "Z"
+        }
+        _save_pending(pending)
+        print(f"[admit] pending: {addr} ({label}) peer={peer_url}", flush=True)
 
         return jsonify({
-            "addr": child_addr,
-            "parent": parent,
-            "status": "admitted"
-        }), 200
+            "status": "pending",
+            "reason": f"admission request saved, await admin approval: f42bbs-admin admit {addr}",
+            "node": F42BBS_NODE_ID,
+            "genesis": _GENESIS,
+            "nodelist": _NODELIST,
+        }), 202
 
     except Exception as e:
-        return jsonify({"rejected": str(e)}), 500
-
+        return jsonify({"status": "rejected", "reason": str(e)}), 500
 
 
 @app.route('/raw/<path:topic>', methods=['GET'])
@@ -507,5 +516,150 @@ def genesis_endpoint():
                     content_type="application/json; charset=utf-8")
 
 
+import json as _json_admit
+import os as _os_admit
+
+_PENDING_FILE = os.path.join(os.getenv("F42BBS_DATA_DIR", "."), "pending.json")
+
+def _load_pending():
+    try:
+        with open(_PENDING_FILE) as f: return _json_admit.load(f)
+    except Exception: return {}
+
+def _save_pending(d):
+    import stat as _stat
+    tmp = _PENDING_FILE + ".tmp"
+    with open(tmp, "w") as f: _json_admit.dump(d, f, indent=2)
+    os.replace(tmp, _PENDING_FILE)
+
+def _publish_nodelist():
+    """Publish current nodelist to net.nodelist topic (gossip)."""
+    try:
+        nodelist = _NODELIST
+        body = _json_admit.dumps(nodelist, ensure_ascii=False)
+        timestamp = __import__("datetime").datetime.utcnow().isoformat() + "Z"
+        msg_id = make_msg_id(F42BBS_NODE_ID, timestamp, body[:16])
+        hmac_val = sign(F42BBS_KEY, msg_id, F42BBS_NODE_ID, "net.nodelist", body)
+        env = Envelope(
+            ver="0.2", type="POST", msg_id=msg_id,
+            origin=F42BBS_NODE_ID, topic="net.nodelist",
+            from_=F42BBS_NODE_ID, to="*",
+            subject="nodelist update",
+            timestamp=timestamp, hops=[], max_hops=10,
+            hmac=hmac_val, body=body, refs=[]
+        )
+        if _ED25519_PRIV:
+            env_dict = _signing.sign_envelope(env.emit(), _ED25519_PRIV)
+        else:
+            env_dict = env.emit()
+        raw = _json_admit.dumps(env_dict)
+        db.store_msg(msg_id, "POST", F42BBS_NODE_ID, "net.nodelist", raw)
+        # fanout to peers
+        for peer_url in _peer_urls:
+            try:
+                import requests as _rq_nl
+                _rq_nl.post(peer_url, json=env_dict, timeout=5)
+            except Exception:
+                pass
+        print(f"[nodelist] published {len(nodelist)} entries to net.nodelist", flush=True)
+    except Exception as _e_nl:
+        print(f"[nodelist] publish failed: {_e_nl}", flush=True)
+
+
+@app.route('/net.nodelist', methods=['GET'])
+def nodelist_gossip():
+    """Return latest net.nodelist message body for gossip."""
+    row = db.get_latest_raw("net.nodelist")
+    if not row:
+        return Response(json.dumps(_NODELIST),
+                        content_type="application/json; charset=utf-8")
+    try:
+        env = json.loads(row)
+        return Response(env.get("body", "[]"),
+                        content_type="application/json; charset=utf-8")
+    except Exception:
+        return Response("[]", content_type="application/json; charset=utf-8")
+
+
+def _bootstrap_nodelist():
+    """On startup: fetch net.nodelist from bootstrap peer, update local nodelist+peers."""
+    if not _peer_urls:
+        return
+    try:
+        import keystore as _ks_bs, signing as _sg_bs, requests as _rq_bs
+        _ks_file    = os.getenv("F42BBS_KEYS")
+        _gs_file    = os.getenv("F42BBS_GENESIS")
+        if _ks_file:    _ks_bs.KEYS_FILE    = _ks_file
+        if _gs_file:    _ks_bs.GENESIS_FILE = _gs_file
+
+        for peer_url in _peer_urls:
+            base = peer_url.replace("/f42bbs/inbound", "")
+            try:
+                genesis = _ks_bs.load_genesis()  # load local genesis
+                try:
+                    gr = _rq_bs.get(f"{base}/genesis", timeout=5)
+                    if gr.status_code == 200:
+                        remote_genesis = gr.json()
+                        remote_roots = remote_genesis.get("root_pubkeys", [])
+                        local_roots  = genesis.get("root_pubkeys", [])
+                        # Adopt remote genesis if:
+                        # - remote has roots AND
+                        # - local genesis is self-only (new node) OR empty
+                        ed_priv, ed_pub = _ks_bs.get_ed25519(F42BBS_NODE_ID)
+                        is_self_genesis = (local_roots == [ed_pub] or not local_roots)
+                        if remote_roots and is_self_genesis:
+                            genesis = remote_genesis
+                            _ks_bs.init_genesis(remote_roots,
+                                                remote_genesis.get("threshold", 1))
+                            print(f"[bootstrap] adopted genesis from {base}: {remote_roots[0][:16]}...", flush=True)
+                except Exception as _eg: print(f"[bootstrap] genesis err: {_eg}", flush=True)
+
+                r = _rq_bs.get(f"{base}/net.nodelist", timeout=10)
+                if r.status_code != 200:
+                    continue
+                remote_nodelist = r.json()
+                if not isinstance(remote_nodelist, list) or not remote_nodelist:
+                    continue
+
+                genesis = _ks_bs.load_genesis()
+                added = 0
+                for entry in remote_nodelist:
+                    addr = entry.get("addr", "")
+                    # Skip if already known
+                    if any(e.get("addr") == addr for e in _NODELIST):
+                        continue
+                    # Verify chain
+                    test_nl = _NODELIST + [entry]
+                    if genesis and not _sg_bs.verify_nodelist_chain(entry, test_nl, genesis):
+                        print(f"[bootstrap] skip {addr}: chain verify failed", flush=True)
+                        continue
+                    _NODELIST.append(entry)
+                    added += 1
+                    # Add as peer if has peer_url
+                    peer_entry_url = entry.get("peer_url", "")
+                    if peer_entry_url and addr != F42BBS_NODE_ID:
+                        try:
+                            db.add_peer(addr, entry.get("label", addr),
+                                        peer_entry_url, "trusted")
+                        except Exception:
+                            pass
+
+                if added:
+                    _ks_bs._load_and_save_nodelist = lambda: None
+                    data = _ks_bs._load()
+                    data["nodelist"] = _NODELIST
+                    _ks_bs._save(data)
+                    print(f"[bootstrap] added {added} nodes from {base}", flush=True)
+                    # Update B4 trust anchors
+                    from transport.http import init_b4_trust
+                    init_b4_trust(_NODELIST, genesis)
+                break
+            except Exception as _e_bs2:
+                print(f"[bootstrap] {base}: {_e_bs2}", flush=True)
+    except Exception as _e_bs:
+        print(f"[bootstrap] failed: {_e_bs}", flush=True)
+
+
 if __name__ == "__main__":
+    _bootstrap_nodelist()
     app.run(host="0.0.0.0", port=STEP_PORT, debug=False)

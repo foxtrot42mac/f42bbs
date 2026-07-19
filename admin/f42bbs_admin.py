@@ -170,12 +170,105 @@ def cmd_status(args):
     print(f"Live OTPs: {len(otps)}")
 
 
+def cmd_admit(args):
+    """Admit a pending node into the nodelist (root signs the entry)."""
+    pending = _load(os.path.join(DATA_DIR, "pending.json"))
+    if not pending:
+        print("no pending admission requests")
+        return
+
+    if not args.addr:
+        print("Pending requests:")
+        for addr, v in pending.items():
+            print(f"  {addr}  label={v.get('label','?')}  peer={v.get('peer_url','?')}  ts={v.get('ts','?')}")
+        return
+
+    addr = args.addr
+    if addr not in pending:
+        print(f"error: {addr} not in pending")
+        print(f"pending: {list(pending.keys())}")
+        sys.exit(1)
+
+    entry = pending[addr]
+
+    sys.path.insert(0, "/opt/f42bbs/core")
+    import keystore, signing
+    keystore.KEYS_FILE    = KEYS_FILE
+    keystore.GENESIS_FILE = GENESIS_FILE
+
+    # Root signs the entry
+    root_priv, root_pub = keystore.get_ed25519(NODE_ADDR)
+
+    signed_entry = signing.sign_nodelist_entry({
+        "addr":         addr,
+        "ed25519_pub":  entry["ed25519_pub"],
+        "x25519_pub":   entry["x25519_pub"],
+        "peer_url":     entry.get("peer_url", ""),
+        "label":        entry.get("label", addr),
+        "sponsor_addr": NODE_ADDR,
+    }, root_priv)
+
+    # Verify chain
+    data = keystore._load()
+    nodelist = data.get("nodelist", [])
+    genesis  = keystore.load_genesis()
+    test_nl  = [e for e in nodelist if e.get("addr") != addr] + [signed_entry]
+
+    ok = signing.verify_nodelist_chain(signed_entry, test_nl, genesis)
+    if not ok:
+        print(f"error: chain verify failed for {addr}")
+        sys.exit(1)
+
+    # Save to nodelist
+    data["nodelist"] = test_nl
+    keystore._save(data)
+
+    # Add as peer in DB
+    try:
+        import sqlite3
+        db_path = os.getenv("F42BBS_DB", "/var/lib/f42bbs/db/f42bbs.db")
+        con = sqlite3.connect(db_path)
+        con.execute("INSERT OR REPLACE INTO peers (node_id, name, address, trust) VALUES (?,?,?,?)",
+                    (addr, entry.get("label", addr), entry.get("peer_url", ""), "trusted"))
+        con.commit()
+        con.close()
+        print(f"peer {addr} added to DB")
+    except Exception as e:
+        print(f"warning: DB peer add failed: {e}")
+
+    # Remove from pending
+    del pending[addr]
+    pending_file = os.path.join(DATA_DIR, "pending.json")
+    _save(pending_file, pending)
+
+    # Publish nodelist gossip via step
+    try:
+        import requests as _rq
+        step_url = os.getenv("F42BBS_STEP_URL", "http://localhost:8001")
+        body_nl  = json.dumps(test_nl, ensure_ascii=False)
+        r = _rq.post(f"{step_url}/step",
+                     data=f",publish topic=net.nodelist body={body_nl}".encode(),
+                     headers={"Content-Type": "text/plain"}, timeout=10)
+        print(f"nodelist published to net.nodelist: {r.text[:40]}")
+    except Exception as e:
+        print(f"warning: gossip publish failed: {e}")
+
+    print(f"\n✓ Admitted {addr} ({entry.get('label','?')})")
+    print(f"  ed25519: {entry['ed25519_pub'][:24]}...")
+    print(f"  sponsor: {NODE_ADDR}")
+    print(f"  chain verify: {ok}")
+    print(f"  nodelist size: {len(test_nl)}")
+
+
 def main():
     parser = argparse.ArgumentParser(prog="f42bbs-admin")
     sub = parser.add_subparsers(dest="command")
 
     p_add = sub.add_parser("addpoint", help="Create new point")
     p_add.add_argument("--label", default="", help="Human label for point")
+
+    p_adm = sub.add_parser("admit", help="Admit pending node into nodelist")
+    p_adm.add_argument("addr", nargs="?", default="", help="Node address to admit (omit to list pending)")
 
     p_otp = sub.add_parser("genotp", help="Generate OTP for point")
     p_otp.add_argument("addr", help="Point address, e.g. 1:42/1.1")
@@ -190,6 +283,7 @@ def main():
         sys.exit(1)
 
     {
+        "admit":      cmd_admit,
         "addpoint":   cmd_addpoint,
         "genotp":     cmd_genotp,
         "listpoints": cmd_listpoints,
