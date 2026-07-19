@@ -58,6 +58,9 @@ cp "$REPO_DIR"/mcp/*.py            "$INSTALL_DIR/mcp/"
 cp "$REPO_DIR"/core/requirements.txt "$INSTALL_DIR/"
 cp "$REPO_DIR"/init/init_keys.py "$INSTALL_DIR/"
 chown -R "$SVC_USER:$SVC_USER" "$INSTALL_DIR"
+# nodes.json required by step_server (legacy peer discovery)
+echo '{"nodes":[]}' > "$INSTALL_DIR/core/nodes.json"
+chown "$SVC_USER:$SVC_USER" "$INSTALL_DIR/core/nodes.json"
 echo "[3/8] code installed to $INSTALL_DIR"
 
 # 4. venv

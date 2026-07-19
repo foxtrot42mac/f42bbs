@@ -20,6 +20,10 @@ _sys_b3.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
     import keystore as _keystore
     import signing as _signing
+    _keys_file    = os.getenv("F42BBS_KEYS")
+    _genesis_file = os.getenv("F42BBS_GENESIS")
+    if _keys_file:    _keystore.KEYS_FILE    = _keys_file
+    if _genesis_file: _keystore.GENESIS_FILE = _genesis_file
     _ED25519_PRIV, _ED25519_PUB = _keystore.get_ed25519(F42BBS_NODE_ID)
     _NODELIST = _keystore.get_nodelist(F42BBS_NODE_ID)
     _GENESIS  = _keystore.load_genesis()
