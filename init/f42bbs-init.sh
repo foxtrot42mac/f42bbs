@@ -56,6 +56,7 @@ cp "$REPO_DIR"/bot/bot.py          "$INSTALL_DIR/bot/"
 cp "$REPO_DIR"/bot/plugins/*.py    "$INSTALL_DIR/bot/plugins/"
 cp "$REPO_DIR"/mcp/*.py            "$INSTALL_DIR/mcp/"
 cp "$REPO_DIR"/core/requirements.txt "$INSTALL_DIR/"
+cp "$REPO_DIR"/init/init_keys.py "$INSTALL_DIR/"
 chown -R "$SVC_USER:$SVC_USER" "$INSTALL_DIR"
 echo "[3/8] code installed to $INSTALL_DIR"
 
