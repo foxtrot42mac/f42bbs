@@ -60,6 +60,7 @@ def cmd_addpoint(args):
         "x25519_pub":  pub,
         "x25519_priv": priv,   # stored on node
         "label":       args.label or addr,
+        "role":        getattr(args, "role", "user") or "user",
         "created_at":  time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     _save(POINTS_FILE, points)
@@ -91,7 +92,7 @@ def cmd_addpoint(args):
     print(f"Use in claude.ai: bbs_claim(otp='{otp}')")
 
 
-def _genotp(addr: str, ttl: int = 300) -> str:
+def _genotp(addr: str, ttl: int = 3600) -> str:
     import random
     words = [
         "alpha","bravo","charlie","delta","echo","foxtrot","golf","hotel",
@@ -271,6 +272,7 @@ def main():
 
     p_add = sub.add_parser("addpoint", help="Create new point")
     p_add.add_argument("--label", default="", help="Human label for point")
+    p_add.add_argument("--role",  default="user", help="Role: admin or user (default: user)")
 
     p_adm = sub.add_parser("admit", help="Admit pending node into nodelist")
     p_adm.add_argument("addr", nargs="?", default="", help="Node address to admit (omit to list pending)")

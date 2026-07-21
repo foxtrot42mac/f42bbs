@@ -227,6 +227,19 @@ def check_invites():
                     invite = json.loads(pt)
                     if invite.get("type") != "conf_invite": continue
                     conf_id = invite["conf_id"]
+                    # Check if inviter is admin on this node
+                    pts_file = os.path.join(os.path.dirname(DB_PATH), "points.json")
+                    try:
+                        import json as _j_role
+                        pts = _j_role.load(open(pts_file))
+                        inviter = pts.get(from_addr, {})
+                        if inviter.get("role") != "admin":
+                            print(f"[bot.0] reject invite from {from_addr} — role={inviter.get('role','unknown')}, admin required", flush=True)
+                            continue
+                    except Exception as _e_role:
+                        print(f"[bot.0] reject invite from {from_addr} — cannot verify role: {_e_role}", flush=True)
+                        continue
+
                     # Check if already accepted
                     ks = keystore._load()
                     confs = ks.get("confs", {})
