@@ -358,9 +358,21 @@ _daemon_db = _DB(_db_path)
 _daemon = Daemon(F42BBS_NODE_ID, _daemon_db, _http_transport_obj, F42BBS_KEY)
 
 def _http_fanout(env):
-    for peer_url in _peer_urls:
+    # Use peers from DB (populated from nodelist), fallback to env
+    try:
+        db_peers = [p['address'] for p in db.get_peers() if p.get('address')]
+    except Exception:
+        db_peers = []
+    all_peers = list(dict.fromkeys(db_peers + _peer_urls))  # dedup, DB first
+    for peer_url in all_peers:
         ec = _copy.deepcopy(env)
         ec.hops = env.hops + [F42BBS_NODE_ID]
+        # B3: sign envelope before sending to peer
+        if _ED25519_PRIV:
+            import json as _j_fanout
+            env_dict = _signing.sign_envelope(ec.emit(), _ED25519_PRIV)
+            from envelope import Envelope as _Env
+            ec = _Env.from_dict(env_dict)
         _http_transport_obj.send(ec, peer_url)
 _daemon._fanout = _http_fanout
 init_http_transport(_daemon, F42BBS_KEY)
