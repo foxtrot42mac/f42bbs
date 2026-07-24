@@ -29,6 +29,9 @@ KEYS_FILE_PATH    = os.getenv("F42BBS_KEYS", "/var/lib/f42bbs/.f42bbs_keys")
 GENESIS_FILE_PATH = os.getenv("F42BBS_GENESIS", "/var/lib/f42bbs/.f42bbs_genesis")
 DB_PATH_DEFAULT   = os.getenv("F42BBS_DB", os.path.join(DATA_DIR, "f42bbs.db"))
 PUBLIC_SERVER_URL = os.getenv("F42BBS_PUBLIC_URL", "")  # explicit override, e.g. https://foxtrot42.org
+
+sys.path.insert(0, DATA_DIR)
+import digest
 NODE_ADDR  = os.getenv("F42BBS_NODE_ID",  "1:42/1")
 STEP_URL   = os.getenv("F42BBS_STEP_URL", "http://localhost:8001")
 PORT       = int(os.getenv("BBS_MCP_PORT", "8006"))
@@ -506,6 +509,136 @@ def execute(cmd: str, point_addr: str) -> str:
             return f"no conference invite from {from_addr}"
         except Exception as _e:
             return f"error: {_e}"
+
+    if verb == "digest_publish":
+        import re as _re_dp
+        m_topic = _re_dp.search(r"topic=([^\s]+)", rest)
+        m_title = _re_dp.search(r'title="([^"]+)"', rest)
+        m_kind  = _re_dp.search(r"kind=([^\s]+)", rest)
+        m_method= _re_dp.search(r"method=([^\s]+)", rest)
+        m_body  = _re_dp.search(r'body="([^"]+)"', rest)
+        if not (m_topic and m_title and m_body):
+            return "usage: digest_publish topic=T title=\"...\" body=\"...\" [kind=result] [method=measured]"
+        topic  = m_topic.group(1)
+        title  = m_title.group(1)
+        content= m_body.group(1)
+        kind   = m_kind.group(1) if m_kind else "result"
+        method = m_method.group(1) if m_method else "unknown"
+
+        pts_file = os.path.join(DATA_DIR, "points.json")
+        try:
+            pts = json.load(open(pts_file))
+            entry = pts.get(point_addr, {})
+            priv = entry.get("ed25519_priv", "")
+        except Exception:
+            priv = ""
+        if not priv:
+            return f"error: {point_addr} has no ed25519 signing key -- run addpoint again to get one"
+
+        try:
+            header, body = digest.make_digest(
+                topic=topic, title=title, origin=point_addr, content=content,
+                method=method, kind=kind, priv_b64=priv,
+            )
+        except digest.DigestError as _de:
+            return f"error: {_de}"
+
+        h_body = json.dumps(header, ensure_ascii=False)
+        r1 = step_cmd(f"publish topic={topic} body={h_body}")
+
+        b_topic = f"digest-body.{header['id']}"
+        b_body  = json.dumps(body, ensure_ascii=False)
+        r2 = step_cmd(f"publish topic={b_topic} body={b_body}")
+
+        return json.dumps({"id": header["id"], "header_publish": r1, "body_publish": r2},
+                          ensure_ascii=False)
+
+    if verb == "digest_get":
+        import re as _re_dg
+        m_topic = _re_dg.search(r"topic=([^\s]+)", rest)
+        if not m_topic:
+            return "usage: digest_get topic=T  (returns latest header on that topic)"
+        topic = m_topic.group(1)
+        raw = step_cmd(f"get topic={topic}")
+        try:
+            header = json.loads(raw)
+        except Exception:
+            return raw  # pass through raw error/text
+
+        verified = digest.verify_digest_full_chain(header, None, STEP_URL)
+        result = {"header": header, "header_verified": verified}
+        return json.dumps(result, ensure_ascii=False)
+
+    if verb == "digest_get_body":
+        import re as _re_dgb
+        m_id = _re_dgb.search(r"id=([^\s]+)", rest)
+        if not m_id:
+            return "usage: digest_get_body id=dg-XXXX"
+        digest_id = m_id.group(1)
+        raw = step_cmd(f"get topic=digest-body.{digest_id}")
+        try:
+            body = json.loads(raw)
+        except Exception:
+            return raw
+        return json.dumps(body, ensure_ascii=False)
+
+    if verb == "digest_revoke":
+        import re as _re_dr
+        m_target = _re_dr.search(r"target=([^\s]+)", rest)
+        m_reason = _re_dr.search(r"reason=([^\s]+)", rest)
+        m_super  = _re_dr.search(r"supersedes=([^\s]+)", rest)
+        if not (m_target and m_reason):
+            return "usage: digest_revoke target=dg-XXXX reason=error|withdrawn|superseded [supersedes=dg-YYYY]"
+
+        pts_file = os.path.join(DATA_DIR, "points.json")
+        try:
+            pts = json.load(open(pts_file))
+            entry = pts.get(point_addr, {})
+            priv = entry.get("ed25519_priv", "")
+        except Exception:
+            priv = ""
+        if not priv:
+            return f"error: {point_addr} has no ed25519 signing key"
+
+        try:
+            rv = digest.make_revoke(
+                target_id=m_target.group(1), origin=point_addr,
+                reason=m_reason.group(1),
+                supersedes=m_super.group(1) if m_super else None,
+                priv_b64=priv,
+            )
+        except digest.DigestError as _de:
+            return f"error: {_de}"
+
+        rv_topic = f"digest-revoke.{m_target.group(1)}"
+        r = step_cmd(f"publish topic={rv_topic} body={json.dumps(rv, ensure_ascii=False)}")
+        return json.dumps({"revoke": rv, "publish": r}, ensure_ascii=False)
+
+    if verb == "digest_check_revoke":
+        import re as _re_dcr
+        m_target = _re_dcr.search(r"target=([^\s]+)", rest)
+        m_topic  = _re_dcr.search(r"topic=([^\s]+)", rest)
+        if not (m_target and m_topic):
+            return "usage: digest_check_revoke target=dg-XXXX topic=T  (topic the original was published under)"
+        target_id = m_target.group(1)
+        if not m_topic:
+            return "usage: digest_check_revoke target=dg-XXXX topic=T  (topic the original was published under)"
+        target_raw = step_cmd(f"get topic={m_topic.group(1)}")
+        try:
+            target_header = json.loads(target_raw)
+        except Exception:
+            return f"error: could not fetch target header: {target_raw}"
+
+        revoke_raw = step_cmd(f"get topic=digest-revoke.{target_id}")
+        try:
+            revoke = json.loads(revoke_raw)
+        except Exception:
+            return json.dumps({"target_id": target_id, "revoked": False, "reason": "no revoke found"})
+
+        authorized = digest.verify_revoke(revoke, target_header, STEP_URL)
+        return json.dumps({"target_id": target_id, "revoke_present": True,
+                          "revoke_authorized": authorized,
+                          "effective": authorized}, ensure_ascii=False)
 
     if verb == "conf_list":
         import sys as _sys_cl; _sys_cl.path.insert(0, DATA_DIR)

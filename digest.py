@@ -447,3 +447,55 @@ def verify_digest_full_chain(header: dict, body: Optional[dict], step_url: str) 
         if not verify_body_matches_header(body, header):
             return False
     return True
+
+
+# ── revoke authorization ────────────────────────────────────────────────────
+
+def verify_revoke(revoke: dict, target_header: dict, step_url: str,
+                   allow_node_revoke: bool = False) -> bool:
+    """
+    A revoke's signature proves it was not forged -- it does NOT prove
+    the signer had the RIGHT to revoke. Same class of bug as yesterday's
+    conf_invite gap: operation exists, signature checks out, authority
+    was never checked (found by Opus, 2026-07-24).
+
+    Checks, in order:
+      1. revoke.origin's signature over the revoke is valid (via the
+         same live net.nodelist -> net.sigkeys chain as a digest).
+      2. revoke.origin == target_header.origin (only the publisher may
+         revoke their own digest) -- OR, if allow_node_revoke=True,
+         revoke.origin is the NODE that sponsors target_header.origin
+         (node revoking a compromised/departed point's digest). This
+         second path is an explicit architectural choice, off by
+         default until Doo decides on it.
+      3. if reason == 'superseded', supersedes must point to a digest
+         from the SAME origin as the target -- otherwise someone could
+         "supersede" a real publication with their own unrelated one.
+    """
+    origin = revoke.get("origin", "")
+    if "." not in origin:
+        return False  # same bare-node-origin rule as digests
+    node_addr = origin.rsplit(".", 1)[0]
+    signer_pub = get_point_ed25519_pub(origin, node_addr, step_url)
+    if not signer_pub:
+        return False
+    if not verify_dict(revoke, signer_pub, excluded=frozenset(["sig"]), sig_field="sig"):
+        return False
+
+    target_origin = target_header.get("origin", "")
+    if origin == target_origin:
+        pass  # publisher revoking their own digest -- always allowed
+    elif allow_node_revoke and node_addr == target_origin.rsplit(".", 1)[0]:
+        pass  # sponsoring node revoking one of its points' digests
+    else:
+        return False  # signer has no authority over this digest
+
+    if revoke.get("reason") == "superseded":
+        # supersedes must exist and (in the caller's context) come from
+        # the same origin as target -- caller is responsible for fetching
+        # the superseding header and checking its origin, since this
+        # function only has target_header, not the whole digest graph.
+        if not revoke.get("supersedes"):
+            return False
+
+    return True
